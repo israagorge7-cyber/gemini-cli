@@ -1,0 +1,85 @@
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'Prompt to send to Gemini'
+        required: false
+        default: 'Generate a JSON design payload for a landing page for a product called OpenDesign Demo. Include title, hero text, and color palette.'
+
+# This workflow runs the Gemini CLI (via npx) and posts the CLI output to an OpenDesign API endpoint.
+# Required repository secrets:
+# - GEMINI_API_KEY : API key for Gemini (or leave empty to use other supported non-interactive auth)
+# - OPEN_DESIGN_API_KEY : API key used by OpenDesign API
+# - OPEN_DESIGN_ENDPOINT : Full URL to the OpenDesign endpoint that accepts POST requests
+
+jobs:
+  run-and-send:
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPEN_DESIGN_API_KEY: ${{ secrets.OPEN_DESIGN_API_KEY }}
+      OPEN_DESIGN_ENDPOINT: ${{ secrets.OPEN_DESIGN_ENDPOINT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ensure jq is installed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Run Gemini CLI via npx (non-interactive)
+        id: run_gemini
+        run: |
+          echo "Prompt: ${{ github.event.inputs.prompt }}"
+          # Use npx to run gemini non-interactively and output JSON
+          npx --yes @google/gemini-cli -p "${{ github.event.inputs.prompt }}" --output-format json > gemini_output.json
+          echo "--- Gemini output ---"
+          cat gemini_output.json
+
+      - name: Package Gemini output
+        id: package
+        run: |
+          # Create a JSON wrapper that includes the raw Gemini CLI JSON output
+          JSON_PAYLOAD=$(jq -n --argfile g gemini_output.json '{source: "gemini-cli", gemini_output: $g}')
+          echo "$JSON_PAYLOAD" > packaged_payload.json
+          echo "Packaged payload size: $(wc -c packaged_payload.json) bytes"
+          cat packaged_payload.json
+
+      - name: Send design to OpenDesign API
+        id: send
+        run: |
+          if [ -z "${OPEN_DESIGN_ENDPOINT}" ]; then
+            echo "ERROR: OPEN_DESIGN_ENDPOINT is not set. Add OPEN_DESIGN_ENDPOINT as a repository secret."
+            exit 1
+          fi
+
+          # Post packaged_payload.json to the OpenDesign endpoint
+          HTTP_CODE=$(curl -sS -o opendesign_response.json -w "%{http_code}" -X POST "${OPEN_DESIGN_ENDPOINT}" \
+            -H "Authorization: Bearer ${OPEN_DESIGN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @packaged_payload.json) || true
+
+          echo "OpenDesign HTTP status: $HTTP_CODE"
+          echo "--- OpenDesign response ---"
+          cat opendesign_response.json || true
+
+          # Fail the job if OpenDesign returned 4xx/5xx
+          if [[ "$HTTP_CODE" =~ ^4|5 ]]; then
+            echo "OpenDesign API returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Upload outputs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini-opendesign-output
+          path: |
+            gemini_output.json
+            packaged_payload.json
+            opendesign_response.json
